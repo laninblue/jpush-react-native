@@ -101,9 +101,10 @@ RCT_EXPORT_MODULE();
                         name:kJPFOpenNotificationToLaunchApp
                       object:nil];
   
-  if ([RCTJPushActionQueue sharedInstance].openedLocalNotification != nil) {
-    [[NSNotificationCenter defaultCenter] postNotificationName:kJPFOpenNotificationToLaunchApp object:[RCTJPushActionQueue sharedInstance].openedLocalNotification];
-  }
+//  if ([RCTJPushActionQueue sharedInstance].openedLocalNotification != nil) {
+//    [self alert:@"openedLocalNotification is not nil"];
+//    [[NSNotificationCenter defaultCenter] postNotificationName:kJPFOpenNotificationToLaunchApp object:[RCTJPushActionQueue sharedInstance].openedLocalNotification];
+//  }
   
   return self;
 }
@@ -125,13 +126,16 @@ RCT_EXPORT_MODULE();
   } else {
     [[NSNotificationCenter defaultCenter] postNotificationName:kJPFNetworkDidCloseNotification object:nil];
   }
-  
 }
 
 - (void)setBridge:(RCTBridge *)bridge {
   _bridge = bridge;
   [RCTJPushActionQueue sharedInstance].openedRemoteNotification = [_bridge.launchOptions objectForKey:UIApplicationLaunchOptionsRemoteNotificationKey];
-  [RCTJPushActionQueue sharedInstance].openedLocalNotification = [_bridge.launchOptions objectForKey:UIApplicationLaunchOptionsLocalNotificationKey];
+  if ([_bridge.launchOptions objectForKey:UIApplicationLaunchOptionsLocalNotificationKey]) {
+    UILocalNotification *localNotification = [_bridge.launchOptions objectForKey:UIApplicationLaunchOptionsLocalNotificationKey];
+    [RCTJPushActionQueue sharedInstance].openedLocalNotification = localNotification.userInfo;// null?
+  }
+  
 }
 
 // request push notification permissions only
@@ -141,20 +145,126 @@ RCT_EXPORT_METHOD(setupPush) {
   [JPUSHService registerForRemoteNotificationConfig:entity delegate:self];
 }
 
+RCT_EXPORT_METHOD(stopPush) {
+  [[UIApplication sharedApplication] unregisterForRemoteNotifications];
+}
+
+RCT_EXPORT_METHOD(hasPermission:(RCTResponseSenderBlock)callback) {
+  float systemVersion = [[UIDevice currentDevice].systemVersion floatValue];
+  
+  
+  if (systemVersion >= 8.0) {
+    UIUserNotificationSettings *settings = [[UIApplication sharedApplication] currentUserNotificationSettings];
+    UIUserNotificationType type = settings.types;
+    if (type == UIUserNotificationTypeNone) {
+      callback(@[@(NO)]);
+    } else {
+      callback(@[@(YES)]);
+    }
+    
+  } else if (systemVersion >= 10.0) {
+    [[UNUserNotificationCenter currentNotificationCenter] getNotificationSettingsWithCompletionHandler:^(UNNotificationSettings * _Nonnull settings) {
+      
+      switch (settings.authorizationStatus)
+      {
+        case UNAuthorizationStatusDenied:
+        case UNAuthorizationStatusNotDetermined:
+          callback(@[@(NO)]);
+          break;
+        case UNAuthorizationStatusAuthorized:
+          callback(@[@(YES)]);
+          break;
+      }
+    }];
+  }
+  
+  
+}
+
+RCT_EXPORT_METHOD(getLaunchAppNotification:(RCTResponseSenderBlock)callback) {
+  NSDictionary *notification;
+  if ([RCTJPushActionQueue sharedInstance].openedRemoteNotification != nil) {
+    notification = [self jpushFormatNotification: [RCTJPushActionQueue sharedInstance].openedRemoteNotification];
+    callback(@[notification]);
+    return;
+  }
+
+  if ([RCTJPushActionQueue sharedInstance].openedLocalNotification != nil) {
+    notification = [self jpushFormatNotification:[RCTJPushActionQueue sharedInstance].openedLocalNotification];
+    callback(@[notification]);
+    return;
+  }
+
+  callback(@[]);
+}
+
 RCT_EXPORT_METHOD(getApplicationIconBadge:(RCTResponseSenderBlock)callback) {
   callback(@[@([UIApplication sharedApplication].applicationIconBadgeNumber)]);
 }
 
+// TODO:
 - (void)openNotificationToLaunchApp:(NSNotification *)notification {
-  id obj = [notification object];
-  [self.bridge.eventDispatcher sendAppEventWithName:@"openNotificationLaunchApp" body:obj];
+  NSDictionary *obj = [notification object];
+  [self.bridge.eventDispatcher sendAppEventWithName:@"openNotificationLaunchApp" body:[self jpushFormatNotification:obj]];
 }
 
+// TODO:
 - (void)openNotification:(NSNotification *)notification {
-  id obj = [notification object];
-  [self.bridge.eventDispatcher sendAppEventWithName:@"openNotification" body:obj];
+  NSDictionary *obj = [notification object];
+  [self.bridge.eventDispatcher sendAppEventWithName:@"openNotification" body: [self jpushFormatNotification:obj]];
 }
 
+- (NSMutableDictionary *)jpushFormatNotification:(NSDictionary *)dic {
+  if (!dic) {
+    return @[].mutableCopy;
+  }
+  if (dic.count == 0) {
+    return @[].mutableCopy;
+  }
+
+  if (dic[@"aps"]) {
+    return [self jpushFormatAPNSDic:dic];
+  } else {
+    return [self jpushFormatLocalNotificationDic:dic];
+  }
+}
+
+- (NSMutableDictionary *)jpushFormatLocalNotificationDic:(NSDictionary *)dic {
+  return [NSMutableDictionary dictionaryWithDictionary:dic];
+}
+  
+- (NSMutableDictionary *)jpushFormatAPNSDic:(NSDictionary *)dic {
+  NSMutableDictionary *extras = @{}.mutableCopy;
+  for (NSString *key in dic) {
+    if([key isEqualToString:@"_j_business"]      ||
+       [key isEqualToString:@"_j_msgid"]         ||
+       [key isEqualToString:@"_j_uid"]           ||
+       [key isEqualToString:@"actionIdentifier"] ||
+       [key isEqualToString:@"aps"]) {
+      continue;
+    }
+    // 和 android 统一将 extras 字段移动到 extras 里面
+    extras[key] = dic[key];
+  }
+  NSMutableDictionary *formatDic = dic.mutableCopy;
+  formatDic[@"extras"] = extras;
+  
+  // 新增 应用状态
+  switch ([UIApplication sharedApplication].applicationState) {
+    case UIApplicationStateInactive:
+      formatDic[@"appState"] = @"inactive";
+      break;
+    case UIApplicationStateActive:
+      formatDic[@"appState"] = @"active";
+      break;
+    case UIApplicationStateBackground:
+      formatDic[@"appState"] = @"background";
+      break;
+    default:
+      break;
+  }
+  return formatDic;
+}
 
 - (void)networkConnecting:(NSNotification *)notification {
   _isJPushDidLogin = false;
@@ -196,27 +306,13 @@ RCT_EXPORT_METHOD(getApplicationIconBadge:(RCTResponseSenderBlock)callback) {
                                                body:[notification userInfo]];
 }
 
+
+// TODO:
 - (void)receiveRemoteNotification:(NSNotification *)notification {
   
   if ([RCTJPushActionQueue sharedInstance].isReactDidLoad == YES) {
     NSDictionary *obj = [notification object];
-    NSMutableDictionary *notificationDic = [[NSMutableDictionary alloc] initWithDictionary:obj];
-    
-    switch ([UIApplication sharedApplication].applicationState) {
-      case UIApplicationStateInactive:
-        notificationDic[@"appState"] = @"inactive";
-        break;
-      case UIApplicationStateActive:
-        notificationDic[@"appState"] = @"active";
-        break;
-      case UIApplicationStateBackground:
-        notificationDic[@"appState"] = @"background";
-        break;
-      default:
-        break;
-    }
-    NSDictionary *event = [NSDictionary dictionaryWithDictionary: notificationDic];
-    [self.bridge.eventDispatcher sendAppEventWithName:@"receiveNotification" body:event];
+    [self.bridge.eventDispatcher sendAppEventWithName:@"receiveNotification" body: [self jpushFormatNotification:obj]];
   } else {
     [[RCTJPushActionQueue sharedInstance] postNotification:notification];
   }
@@ -225,6 +321,10 @@ RCT_EXPORT_METHOD(getApplicationIconBadge:(RCTResponseSenderBlock)callback) {
 - (dispatch_queue_t)methodQueue
 {
   return dispatch_get_main_queue();
+}
+
++ (BOOL)requiresMainQueueSetup {
+    return YES;
 }
 
 - (void)didRegistRemoteNotification:(NSString *)token {
@@ -312,7 +412,9 @@ RCT_EXPORT_METHOD( setTags:(NSArray *)tags
   self.asyCallback = callback;
   [JPUSHService setTags:tagSet completion:^(NSInteger iResCode, NSSet *iTags, NSInteger seq) {
     if (iResCode == 0) {
-      callback(@[@{@"tags": [iTags allObjects] ?: @[]}]);
+      callback(@[@{@"tags": [iTags allObjects] ?: @[],
+                   @"errorCode": @(0)
+                   }]);
     } else {
       callback(@[@{@"errorCode": @(iResCode)}]);
     }
@@ -328,7 +430,9 @@ RCT_EXPORT_METHOD( setAlias:(NSString *)alias
   self.asyCallback = callback;
   [JPUSHService setAlias:alias completion:^(NSInteger iResCode, NSString *iAlias, NSInteger seq) {
     if (iResCode == 0) {
-      callback(@[@{@"alias": iAlias ?: @""}]);
+      callback(@[@{@"alias": iAlias ?: @"",
+                   @"errorCode": @(0)
+                   }]);
     } else {
       callback(@[@{@"errorCode": @(iResCode)}]);
     }
@@ -344,7 +448,9 @@ RCT_EXPORT_METHOD( addTags:(NSArray *)tags
   }
   [JPUSHService addTags:tagSet completion:^(NSInteger iResCode, NSSet *iTags, NSInteger seq) {
     if (iResCode == 0) {
-      callback(@[@{@"tags": [iTags allObjects] ?: @[]}]);
+      callback(@[@{@"tags": [iTags allObjects] ?: @[],
+                   @"errorCode": @(0)
+                   }]);
     } else {
       callback(@[@{@"errorCode": @(iResCode)}]);
     }
@@ -360,7 +466,9 @@ RCT_EXPORT_METHOD( deleteTags:(NSArray *)tags
   }
   [JPUSHService deleteTags:tagSet completion:^(NSInteger iResCode, NSSet *iTags, NSInteger seq) {
     if (iResCode == 0) {
-      callback(@[@{@"tags": [iTags allObjects] ?: @[]}]);
+      callback(@[@{@"tags": [iTags allObjects] ?: @[],
+                   @"errorCode": @(0)
+                   }]);
     } else {
       callback(@[@{@"errorCode": @(iResCode)}]);
     }
@@ -370,7 +478,9 @@ RCT_EXPORT_METHOD( deleteTags:(NSArray *)tags
 RCT_EXPORT_METHOD( cleanTags:(RCTResponseSenderBlock)callback) {
   [JPUSHService cleanTags:^(NSInteger iResCode, NSSet *iTags, NSInteger seq) {
     if (iResCode == 0) {
-      callback(@[@{@"tags": [iTags allObjects] ?: @[]}]);
+      callback(@[@{@"tags": [iTags allObjects] ?: @[],
+                   @"errorCode": @(0)
+                   }]);
     } else {
       callback(@[@{@"errorCode": @(iResCode)}]);
     }
@@ -380,7 +490,9 @@ RCT_EXPORT_METHOD( cleanTags:(RCTResponseSenderBlock)callback) {
 RCT_EXPORT_METHOD( getAllTags:(RCTResponseSenderBlock)callback) {
   [JPUSHService getAllTags:^(NSInteger iResCode, NSSet *iTags, NSInteger seq) {
     if (iResCode == 0) {
-      callback(@[@{@"tags": [iTags allObjects] ?: @[]}]);
+      callback(@[@{@"tags": [iTags allObjects] ?: @[],
+                   @"errorCode": @(0)
+                   }]);
     } else {
       callback(@[@{@"errorCode": @(iResCode)}]);
     }
@@ -391,7 +503,9 @@ RCT_EXPORT_METHOD(checkTagBindState:(NSString *)tag
                            callback:(RCTResponseSenderBlock)callback) {
   [JPUSHService validTag:tag completion:^(NSInteger iResCode, NSSet *iTags, NSInteger seq, BOOL isBind) {
     if (iResCode == 0) {
-      callback(@[@{@"isBind": @(isBind)}]);
+      callback(@[@{@"isBind": @(isBind),
+                   @"errorCode": @(0)
+                   }]);
     } else {
       callback(@[@{@"errorCode": @(iResCode)}]);
     }
@@ -401,7 +515,9 @@ RCT_EXPORT_METHOD(checkTagBindState:(NSString *)tag
 RCT_EXPORT_METHOD(deleteAlias:(RCTResponseSenderBlock)callback) {
   [JPUSHService deleteAlias:^(NSInteger iResCode, NSString *iAlias, NSInteger seq) {
     if (iResCode == 0) {
-      callback(@[@{@"alias": iAlias ?: @""}]);
+      callback(@[@{@"alias": iAlias ?: @"",
+                   @"errorCode": @(0)
+                   }]);
     } else {
       callback(@[@{@"errorCode": @(iResCode)}]);
     }
@@ -411,7 +527,9 @@ RCT_EXPORT_METHOD(deleteAlias:(RCTResponseSenderBlock)callback) {
 RCT_EXPORT_METHOD(getAlias:(RCTResponseSenderBlock)callback) {
   [JPUSHService getAlias:^(NSInteger iResCode, NSString *iAlias, NSInteger seq) {
     if (iResCode == 0) {
-      callback(@[@{@"alias": iAlias ?: @""}]);
+      callback(@[@{@"alias": iAlias ?: @"",
+                   @"errorCode": @(0)
+                   }]);
     } else {
       callback(@[@{@"errorCode": @(iResCode)}]);
     }
@@ -659,10 +777,12 @@ RCT_EXPORT_METHOD(clearAllLocalNotifications) {
  * - 通过本 API 把当前客户端(当前这个用户的) 的实际 badge 设置到服务器端保存起来;
  * - 调用服务器端 API 发 APNs 时(通常这个调用是批量针对大量用户),
  *   使用 "+1" 的语义, 来表达需要基于目标用户实际的 badge 值(保存的) +1 来下发通知时带上新的 badge 值;
+ *
+ * setBadge(-1): 支持清空icon的badge而不清空通知栏消息
  */
 RCT_EXPORT_METHOD(setBadge:(NSInteger)value callback:(RCTResponseSenderBlock)callback) {// ->Bool
   [[UIApplication sharedApplication] setApplicationIconBadgeNumber:value];
-  NSNumber *badgeNumber = [NSNumber numberWithBool:[JPUSHService setBadge: value]];
+  NSNumber *badgeNumber = [NSNumber numberWithBool:[JPUSHService setBadge: value > 0 ? value : 0]];
   callback(@[badgeNumber]);
 }
 
@@ -697,6 +817,13 @@ RCT_EXPORT_METHOD(getRegistrationID:(RCTResponseSenderBlock)callback) {// -> str
   NSLog(@"simulator can not get registrationid");
   callback(@[@""]);
 #elif TARGET_OS_IPHONE//真机
+    if ([JPUSHService registrationID] != nil && ![[JPUSHService registrationID] isEqualToString:@""]) {
+            // 如果已经成功获取 registrationID，从本地获取直接缓存
+            callback(@[[JPUSHService registrationID]]);
+            return;
+    }
+    
+  //    第一次获取时需要 jpush login 状态
   if (_isJPushDidLogin) {
     callback(@[[JPUSHService registrationID]]);
   } else {
@@ -734,6 +861,25 @@ RCT_EXPORT_METHOD(setDebugMode) {
 RCT_EXPORT_METHOD(setLogOFF) {
   [JPUSHService setLogOFF];
 }
+
+RCT_EXPORT_METHOD(clearAllNotifications) {
+  if ([[UIDevice currentDevice].systemVersion floatValue] >= 10.0) {
+    [UNUserNotificationCenter.currentNotificationCenter removeAllPendingNotificationRequests];
+  } else {
+    [[UIApplication sharedApplication] cancelAllLocalNotifications];
+  }
+}
+
+RCT_EXPORT_METHOD(removeLocalNotification:(NSInteger)identify) {
+  JPushNotificationIdentifier *pushIdentify = [[JPushNotificationIdentifier alloc] init];
+  pushIdentify.identifiers = @[[@(identify) description]];
+  [JPUSHService removeNotification: pushIdentify];
+}
+
+RCT_EXPORT_METHOD(clearLocalNotifications) {
+  [JPUSHService removeNotification: nil];
+}
+
 
 - (void)jpushNotificationCenter:(UNUserNotificationCenter *)center willPresentNotification:(UNNotification *)notification withCompletionHandler:(void (^)(NSInteger))completionHandler {
   NSDictionary * userInfo = notification.request.content.userInfo;

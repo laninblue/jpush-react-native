@@ -2,20 +2,28 @@ package cn.jpush.reactnativejpush;
 
 import android.app.Activity;
 import android.app.ActivityManager;
+import android.app.AppOpsManager;
 import android.app.Notification;
+import android.app.NotificationManager;
 import android.content.BroadcastReceiver;
 import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
+import android.content.pm.ApplicationInfo;
+import android.os.Build;
 import android.os.Bundle;
+import android.util.Log;
+import android.util.SparseArray;
 
 import com.facebook.react.bridge.Arguments;
 import com.facebook.react.bridge.Callback;
+import com.facebook.react.bridge.LifecycleEventListener;
 import com.facebook.react.bridge.ReactApplicationContext;
 import com.facebook.react.bridge.ReactContextBaseJavaModule;
 import com.facebook.react.bridge.ReactMethod;
 import com.facebook.react.bridge.ReadableArray;
 import com.facebook.react.bridge.ReadableMap;
+import com.facebook.react.bridge.ReadableMapKeySetIterator;
 import com.facebook.react.bridge.WritableArray;
 import com.facebook.react.bridge.WritableMap;
 import com.facebook.react.modules.core.DeviceEventManagerModule;
@@ -23,9 +31,11 @@ import com.facebook.react.modules.core.DeviceEventManagerModule;
 
 import org.json.JSONObject;
 
+import java.lang.reflect.Field;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
 import java.text.SimpleDateFormat;
 import java.util.Date;
-import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -38,12 +48,16 @@ import cn.jpush.android.api.JPushMessage;
 import cn.jpush.android.data.JPushLocalNotification;
 import cn.jpush.android.service.JPushMessageReceiver;
 
-public class JPushModule extends ReactContextBaseJavaModule {
+public class JPushModule extends ReactContextBaseJavaModule implements LifecycleEventListener {
 
     private static String TAG = "JPushModule";
     private Context mContext;
     private static String mEvent;
+    private static String mRidEvent;
+    private static String mConnectEvent;
     private static Bundle mCachedBundle;
+    private static Bundle mRidBundle;
+    private static Bundle mConnectCachedBundle;
     private static ReactApplicationContext mRAC;
 
     private final static String RECEIVE_NOTIFICATION = "receiveNotification";
@@ -52,10 +66,12 @@ public class JPushModule extends ReactContextBaseJavaModule {
     private final static String RECEIVE_REGISTRATION_ID = "getRegistrationId";
     private final static String CONNECTION_CHANGE = "connectionChange";
 
-    private static HashMap<Integer, Callback> sCacheMap = new HashMap<Integer, Callback>();
+    private static SparseArray<Callback> sCacheMap;
+    private static Callback mGetRidCallback;
 
     public JPushModule(ReactApplicationContext reactContext) {
         super(reactContext);
+        reactContext.addLifecycleEventListener(this);
     }
 
     @Override
@@ -71,20 +87,29 @@ public class JPushModule extends ReactContextBaseJavaModule {
     @Override
     public void initialize() {
         super.initialize();
+        sCacheMap = new SparseArray<>();
     }
 
     @Override
     public void onCatalystInstanceDestroy() {
         super.onCatalystInstanceDestroy();
+        Logger.i(TAG, "onCatalystInstanceDestroy");
         mCachedBundle = null;
+        mRidBundle = null;
+        mConnectCachedBundle = null;
         if (null != sCacheMap) {
             sCacheMap.clear();
         }
+        mEvent = null;
+        mRidEvent = null;
+        mConnectEvent = null;
+        mGetRidCallback = null;
+        mRAC = null;
     }
 
     @ReactMethod
     public void initPush() {
-        mContext = getCurrentActivity();
+        mContext = getReactApplicationContext();
         JPushInterface.init(getReactApplicationContext());
         Logger.toast(mContext, "Init push success");
         Logger.i(TAG, "init Success!");
@@ -106,17 +131,25 @@ public class JPushModule extends ReactContextBaseJavaModule {
         successCallback.invoke(map);
     }
 
+
     @ReactMethod
     public void stopPush() {
-        mContext = getCurrentActivity();
+        mContext = getReactApplicationContext();
         JPushInterface.stopPush(getReactApplicationContext());
         Logger.i(TAG, "Stop push");
         Logger.toast(mContext, "Stop push success");
     }
 
     @ReactMethod
+    public void hasPermission(Callback callback) {
+        callback.invoke(hasPermission("OP_POST_NOTIFICATION"));
+    }
+
+
+
+    @ReactMethod
     public void resumePush() {
-        mContext = getCurrentActivity();
+        mContext = getReactApplicationContext();
         JPushInterface.resumePush(getReactApplicationContext());
         Logger.i(TAG, "Resume push");
         Logger.toast(mContext, "Resume push success");
@@ -150,13 +183,12 @@ public class JPushModule extends ReactContextBaseJavaModule {
                     WritableMap map = Arguments.createMap();
                     map.putInt("id", mCachedBundle.getInt(JPushInterface.EXTRA_NOTIFICATION_ID));
                     map.putString("message", mCachedBundle.getString(JPushInterface.EXTRA_MESSAGE));
+                    map.putString("content", mCachedBundle.getString(JPushInterface.EXTRA_MESSAGE));
+                    map.putString("content_type", mCachedBundle.getString(JPushInterface.EXTRA_CONTENT_TYPE));
+                    map.putString("title", mCachedBundle.getString(JPushInterface.EXTRA_TITLE));
                     map.putString("extras", mCachedBundle.getString(JPushInterface.EXTRA_EXTRA));
                     mRAC.getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter.class)
                             .emit(mEvent, map);
-                    break;
-                case RECEIVE_REGISTRATION_ID:
-                    mRAC.getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter.class)
-                            .emit(mEvent, mCachedBundle.getString(JPushInterface.EXTRA_REGISTRATION_ID));
                     break;
                 case RECEIVE_NOTIFICATION:
                 case OPEN_NOTIFICATION:
@@ -167,15 +199,32 @@ public class JPushModule extends ReactContextBaseJavaModule {
                     mRAC.getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter.class)
                             .emit(mEvent, map);
                     break;
-                case CONNECTION_CHANGE:
-                    if (mCachedBundle != null) {
-                        mRAC.getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter.class)
-                                .emit(mEvent, mCachedBundle.getBoolean(JPushInterface.EXTRA_CONNECTION_CHANGE, false));
-                    }
-                    break;
             }
+
             mEvent = null;
             mCachedBundle = null;
+        }
+
+        if (mRidEvent != null) {
+            Logger.i(TAG, "Sending ridevent : " + mRidEvent);
+            if (mGetRidCallback != null) {
+                mGetRidCallback.invoke(mRidBundle.getString(JPushInterface.EXTRA_REGISTRATION_ID));
+                mGetRidCallback = null;
+            }
+            mRAC.getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter.class)
+                    .emit(mRidEvent, mRidBundle.getString(JPushInterface.EXTRA_REGISTRATION_ID));
+            mRidEvent = null;
+            mRidBundle = null;
+        }
+
+        if (mConnectEvent != null) {
+            Logger.i(TAG, "Sending connectevent : " + mConnectEvent);
+            if (mConnectCachedBundle != null) {
+                mRAC.getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter.class).emit(mConnectEvent,
+                        mConnectCachedBundle.getBoolean(JPushInterface.EXTRA_CONNECTION_CHANGE, false));
+            }
+            mConnectEvent = null;
+            mConnectCachedBundle = null;
         }
     }
 
@@ -371,9 +420,12 @@ public class JPushModule extends ReactContextBaseJavaModule {
     @ReactMethod
     public void getRegistrationID(Callback callback) {
         try {
-            mContext = getCurrentActivity();
-            String id = JPushInterface.getRegistrationID(mContext);
-            callback.invoke(id);
+            String id = JPushInterface.getRegistrationID(getReactApplicationContext());
+            if (id != null) {
+                callback.invoke(id);
+            } else {
+                mGetRidCallback = callback;
+            }
         } catch (Exception e) {
             e.printStackTrace();
         }
@@ -400,7 +452,7 @@ public class JPushModule extends ReactContextBaseJavaModule {
     @ReactMethod
     public void clearNotificationById(int id) {
         try {
-            mContext = getCurrentActivity();
+            mContext = getReactApplicationContext();
             JPushInterface.clearNotificationById(mContext, id);
         } catch (Exception e) {
             e.printStackTrace();
@@ -410,7 +462,7 @@ public class JPushModule extends ReactContextBaseJavaModule {
     @ReactMethod
     public void setLatestNotificationNumber(int number) {
         try {
-            mContext = getCurrentActivity();
+            mContext = getReactApplicationContext();
             JPushInterface.setLatestNotificationNumber(mContext, number);
         } catch (Exception e) {
             e.printStackTrace();
@@ -420,7 +472,7 @@ public class JPushModule extends ReactContextBaseJavaModule {
     @ReactMethod
     public void setPushTime(ReadableMap map) {
         try {
-            mContext = getCurrentActivity();
+            mContext = getReactApplicationContext();
             ReadableArray array = map.getArray("days");
             Set<Integer> days = new HashSet<Integer>();
             for (int i=0; i < array.size(); i++) {
@@ -441,13 +493,35 @@ public class JPushModule extends ReactContextBaseJavaModule {
     @ReactMethod
     public void setSilenceTime(ReadableMap map) {
         try {
-            mContext = getCurrentActivity();
+            mContext = getReactApplicationContext();
             String starTime = map.getString("startTime");
             String endTime = map.getString("endTime");
             String[] sTime = starTime.split(":");
             String[] eTime = endTime.split(":");
             JPushInterface.setSilenceTime(mContext, Integer.valueOf(sTime[0]), Integer.valueOf(sTime[1]),
                     Integer.valueOf(eTime[0]), Integer.valueOf(eTime[1]));
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+    }
+
+
+    @ReactMethod
+    public void setGeofenceInterval(double interval) {
+        try {
+            mContext = getReactApplicationContext();
+            JPushInterface.setGeofenceInterval(mContext, (long)interval);
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+    }
+
+
+    @ReactMethod
+    public void setMaxGeofenceNumber(int maxNumber) {
+        try {
+            mContext = getReactApplicationContext();
+            JPushInterface.setMaxGeofenceNumber(mContext, maxNumber);
         } catch (Exception e) {
             e.printStackTrace();
         }
@@ -463,8 +537,9 @@ public class JPushModule extends ReactContextBaseJavaModule {
             ln.setContent(map.getString("content"));
             ReadableMap extra = map.getMap("extra");
             JSONObject json = new JSONObject();
-            while (extra.keySetIterator().hasNextKey()) {
-                String key = extra.keySetIterator().nextKey();
+            ReadableMapKeySetIterator iterator = extra.keySetIterator();
+            while (iterator.hasNextKey()) {
+                String key = iterator.nextKey();
                 json.put(key, extra.getString(key));
             }
             ln.setExtras(json.toString());
@@ -478,6 +553,41 @@ public class JPushModule extends ReactContextBaseJavaModule {
         }
     }
 
+    @ReactMethod
+    public void removeLocalNotification(int id) {
+        try {
+            Logger.d(TAG, "removeLocalNotification："+id);
+            JPushInterface.removeLocalNotification(getReactApplicationContext(), id);
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+    }
+    @ReactMethod
+    public void clearLocalNotifications() {
+        try {
+            Logger.d(TAG, "clearLocalNotifications");
+            JPushInterface.clearLocalNotifications(getReactApplicationContext());
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+    }
+
+    @Override
+    public void onHostResume() {
+        Logger.d(TAG, "onHostResume");
+    }
+
+    @Override
+    public void onHostPause() {
+        Logger.d(TAG, "onHostPause");
+    }
+
+    @Override
+    public void onHostDestroy() {
+        Logger.d(TAG, "onHostDestroy");
+        mRAC = null;
+    }
+
     /**
      * 接收自定义消息,通知,通知点击事件等事件的广播
      * 文档链接:http://docs.jiguang.cn/client/android_api/
@@ -489,8 +599,9 @@ public class JPushModule extends ReactContextBaseJavaModule {
 
         @Override
         public void onReceive(Context context, Intent data) {
-            mCachedBundle = data.getExtras();
+
             if (JPushInterface.ACTION_MESSAGE_RECEIVED.equals(data.getAction())) {
+                mCachedBundle = data.getExtras();
                 try {
                     String message = data.getStringExtra(JPushInterface.EXTRA_MESSAGE);
                     Logger.i(TAG, "收到自定义消息: " + message);
@@ -502,6 +613,7 @@ public class JPushModule extends ReactContextBaseJavaModule {
                     e.printStackTrace();
                 }
             } else if (JPushInterface.ACTION_NOTIFICATION_RECEIVED.equals(data.getAction())) {
+                mCachedBundle = data.getExtras();
                 try {
                     // 通知内容
                     String alertContent = mCachedBundle.getString(JPushInterface.EXTRA_ALERT);
@@ -517,21 +629,15 @@ public class JPushModule extends ReactContextBaseJavaModule {
                     e.printStackTrace();
                 }
             } else if (JPushInterface.ACTION_NOTIFICATION_OPENED.equals(data.getAction())) {
+                mCachedBundle = data.getExtras();
                 try {
                     Logger.d(TAG, "用户点击打开了通知");
                     // 通知内容
                     String alertContent = mCachedBundle.getString(JPushInterface.EXTRA_ALERT);
                     // extra 字段的 json 字符串
                     String extras = mCachedBundle.getString(JPushInterface.EXTRA_EXTRA);
-                    Intent intent;
-                    if (isApplicationRunningBackground(context)) {
-                        intent = new Intent();
-                        intent.setClassName(context.getPackageName(), context.getPackageName() + ".MainActivity");
-                        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_SINGLE_TOP | Intent.FLAG_ACTIVITY_CLEAR_TOP);
-                    } else {
-                        intent = context.getPackageManager().getLaunchIntentForPackage(context.getPackageName());
-                        intent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_SINGLE_TOP | Intent.FLAG_ACTIVITY_CLEAR_TOP);
-                    }
+                    Intent intent = context.getPackageManager().getLaunchIntentForPackage(context.getPackageName());
+                    intent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_SINGLE_TOP | Intent.FLAG_ACTIVITY_CLEAR_TOP);
                     intent.putExtras(mCachedBundle);
                     context.startActivity(intent);
                     mEvent = OPEN_NOTIFICATION;
@@ -546,8 +652,9 @@ public class JPushModule extends ReactContextBaseJavaModule {
                 // After JPush finished registering, will send this broadcast, use JPushModule.addGetRegistrationIdListener
                 // to get registrationId in the first instance.
             } else if (JPushInterface.ACTION_REGISTRATION_ID.equals(data.getAction())) {
+                mRidBundle = data.getExtras();
                 try {
-                    mEvent = RECEIVE_REGISTRATION_ID;
+                    mRidEvent = RECEIVE_REGISTRATION_ID;
                     if (mRAC != null) {
                         sendEvent();
                     }
@@ -555,8 +662,9 @@ public class JPushModule extends ReactContextBaseJavaModule {
                     e.printStackTrace();
                 }
             } else if (JPushInterface.ACTION_CONNECTION_CHANGE.equals(data.getAction())) {
+                mConnectCachedBundle = data.getExtras();
                 try {
-                    mEvent = CONNECTION_CHANGE;
+                    mConnectEvent = CONNECTION_CHANGE;
                     if (mRAC != null) {
                         sendEvent();
                     }
@@ -653,6 +761,7 @@ public class JPushModule extends ReactContextBaseJavaModule {
             intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
             intent.setClassName(mRAC, mRAC.getPackageName() + "." + activityName);
             mRAC.startActivity(intent);
+
         } catch (Exception e) {
             e.printStackTrace();
         }
@@ -688,5 +797,44 @@ public class JPushModule extends ReactContextBaseJavaModule {
             e.printStackTrace();
         }
 
+    }
+
+    private boolean hasPermission(String appOpsServiceId) {
+
+        Context context = getReactApplicationContext();
+        if (Build.VERSION.SDK_INT >= 24) {
+            NotificationManager mNotificationManager = (NotificationManager) context.getSystemService(
+                    Context.NOTIFICATION_SERVICE);
+            return mNotificationManager.areNotificationsEnabled();
+        }else if(Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT){
+            AppOpsManager mAppOps = (AppOpsManager) context.getSystemService(Context.APP_OPS_SERVICE);
+            ApplicationInfo appInfo = context.getApplicationInfo();
+
+            String pkg = context.getPackageName();
+            int uid = appInfo.uid;
+            Class appOpsClazz;
+
+            try {
+                appOpsClazz = Class.forName(AppOpsManager.class.getName());
+                Method checkOpNoThrowMethod = appOpsClazz.getMethod("checkOpNoThrow", Integer.TYPE, Integer.TYPE,
+                        String.class);
+                Field opValue = appOpsClazz.getDeclaredField(appOpsServiceId);
+                int value = opValue.getInt(Integer.class);
+                Object result = checkOpNoThrowMethod.invoke(mAppOps, value, uid, pkg);
+                return Integer.parseInt(result.toString()) == AppOpsManager.MODE_ALLOWED;
+            } catch (InvocationTargetException e) {
+                e.printStackTrace();
+            } catch (IllegalAccessException e) {
+                e.printStackTrace();
+            } catch (NoSuchMethodException e) {
+                e.printStackTrace();
+            } catch (NoSuchFieldException e) {
+                e.printStackTrace();
+            } catch (ClassNotFoundException e) {
+                e.printStackTrace();
+            }
+        }
+
+        return false;
     }
 }
